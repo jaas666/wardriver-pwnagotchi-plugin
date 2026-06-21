@@ -16,7 +16,7 @@ A complete plugin for wardriving on your pwnagotchi. It saves all networks seen 
 ## ✨ Features
 - Log every network seen with its position
 - Support GPS coordinates retrieval from Bettercap, GPSD and Pwndroid application
-- Automatic and manual upload of wardriving sessions to WiGLE
+- Automatic and manual upload of wardriving sessions to WiGLE, WDGWars, and SoulCage
 - Web UI with lots of information
 - Export single wardriving session in CSV
 - Label and icon on display with status information
@@ -63,13 +63,23 @@ main.plugins.wardriver.ui.icon_reverse = false
 main.plugins.wardriver.ui.position.x = 7
 main.plugins.wardriver.ui.position.y = 95
 
-# Enable WiGLE automatic file uploading
+# Enable WiGLE automatic upload
 main.plugins.wardriver.wigle.enabled = true
-
-# WiGLE API key (encoded)
+# WiGLE API key (encoded — see Wigle configuration section below)
 main.plugins.wardriver.wigle.api_key = "xyz..."
 # Enable commercial use of your reported data
 main.plugins.wardriver.wigle.donate = false
+
+# Enable WDGWars automatic upload
+main.plugins.wardriver.wdgwars.enabled = true
+# WDGWars API key (see WDGWars configuration section below)
+main.plugins.wardriver.wdgwars.api_key = "xyz..."
+
+# Enable SoulCage automatic upload
+main.plugins.wardriver.soulcage.enabled = true
+# SoulCage API key (see SoulCage configuration section below)
+main.plugins.wardriver.soulcage.api_key = "xyz..."
+
 # OPTIONAL: networks whitelist aka don't log these networks
 main.plugins.wardriver.whitelist = [
     "network-1",
@@ -155,6 +165,20 @@ In order to be able to upload your discovered networks to WiGLE, you need to reg
 
 You are good to go. You can test if the key is working by opening the wardriver web page and clicking on `Stats` tab. If you get your WiGLE profile with your stats, the API key is working fine.
 
+### 🏁 WDGWars configuration
+
+[WDGWars](https://wdgwars.pl) is a competitive wardriving platform where you claim territory by owning the most access points in map cells. Follow these steps to get your API key:
+1. Register an account at [https://wdgwars.pl](https://wdgwars.pl)
+2. Go to **Account → API Keys** and generate a new key
+3. Add the 64-character hex key inside `main.plugins.wardriver.wdgwars.api_key` in `/etc/pwnagotchi/config.toml`
+
+### 💀 SoulCage configuration
+
+[SoulCage](https://soulcage.win) is another territory-claiming wardriving game. Follow these steps to get your API key:
+1. Register an account at [https://soulcage.win](https://soulcage.win)
+2. Go to **Account → API Keys** and generate a new key
+3. Add the 64-character hex key inside `main.plugins.wardriver.soulcage.api_key` in `/etc/pwnagotchi/config.toml`
+
 ## 🔥 Upgrade
 
 If you have installed the plugin following the method described in the [previous](#-installation) section, you can upgrade the plugin version with:
@@ -176,7 +200,7 @@ Otherwise, if you have installed the plugin manually just download the new versi
 
 ### 🖥️ Web UI
 
-All the operations are done through the plugin's Web UI. Inside of it, you can see the current wardriving session statistics, global statistics (including your WiGLE profile), all networks seen by your pwnagotchi and also plot the networks on map. You can upload automatically the sessions on WiGLE when internet is available, or upload them manually through the Web UI.
+All the operations are done through the plugin's Web UI. Inside of it, you can see the current wardriving session statistics, global statistics (including your WiGLE profile), all networks seen by your pwnagotchi and also plot the networks on map. You can upload sessions automatically when internet is available, or upload them manually to WiGLE, WDGWars, and SoulCage through the Web UI.
 
 You can reach the Web UI by opening `http://<pwnagotchi ip>:8080/plugins/wardriver` in your browser.
 
@@ -188,11 +212,18 @@ If you don't want some networks to be logged, you can add the SSID inside `wardr
 
 **Note:** the SSIDs inside the `main.whitelist` array will always be ignored.
 
-### 🌐 WiGLE upload
+### 🌐 Automatic uploads (WiGLE, WDGWars, SoulCage)
 
-If you have enabled it, once internet is available, the plugin will upload all previous session files on WiGLE. Please note that the current session will not be uploaded as it is considered still in progress. Don't worry, it'll be uploaded the next time your pwnagotchi starts with internet connection.
+If you have enabled any of the upload services, once internet is available the plugin will automatically upload all previous completed sessions to each enabled service. The current in-progress session is never uploaded automatically — it will be picked up the next time your pwnagotchi connects to the internet.
 
-If you just want to upload sessions to WiGLE manually you can still do it. All you have to do, is configuring your API key and use the corresponding button in the sessions tab of the Web UI. You can also download the CSV file locally for a specific session.
+Each service tracks its upload status independently, so a session can be uploaded to WiGLE but still pending for WDGWars or SoulCage.
+
+You can also trigger uploads manually at any time from the **Sessions** tab of the Web UI using the per-row action buttons:
+- 🔵 upload to WiGLE
+- 🟠 upload to WDGWars
+- 🟣 upload to SoulCage
+
+You can also download the CSV file for any session from the same tab.
 
 ## ❤️ Contribution
 
