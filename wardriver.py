@@ -845,9 +845,10 @@ class Wardriver(plugins.Plugin):
             return 'WEP'
         return 'OPEN'
 
-    def __upload_session_to_niomi(self, session_id, api_key, base_url, service_name, mark_uploaded_func):
+    def __upload_session_to_wdgwars(self, session_id):
+        api_key = self.__wdgwars_api_key
         networks = self.__db.session_networks(session_id)
-        niomi_networks = []
+        wdg_networks = []
         for n in networks:
             entry = {
                 'bssid':      n['mac'],
@@ -861,18 +862,17 @@ class Wardriver(plugins.Plugin):
                 'type':       'WIFI',
             }
             try:
-                alt = float(n['altitude'])
-                entry['alt'] = alt
+                entry['alt'] = float(n['altitude'])
             except (TypeError, ValueError):
                 pass
-            niomi_networks.append(entry)
+            wdg_networks.append(entry)
 
-        payload = {'networks': niomi_networks, 'aircraft': [], 'meshcore_nodes': []}
+        payload = {'networks': wdg_networks, 'aircraft': [], 'meshcore_nodes': []}
         body = _sign_payload(api_key, payload)
 
         try:
             response = requests.post(
-                url=f'{base_url}/api/wardrive/upload/',
+                url='https://wdgwars.pl/api/wardrive/upload/',
                 data=body,
                 headers={
                     'Content-Type': 'application/json',
@@ -882,11 +882,55 @@ class Wardriver(plugins.Plugin):
             )
             response.raise_for_status()
             result = response.json()
-            logging.info(f'[WARDRIVER] Uploaded session {session_id} to {service_name}: {result.get("imported", 0)} networks queued')
-            mark_uploaded_func(session_id)
+            logging.info(f'[WARDRIVER] Uploaded session {session_id} to WDGWars: {result.get("imported", 0)} networks queued')
+            self.__db.session_uploaded_to_wdgwars(session_id)
             return True
         except Exception as e:
-            logging.error(f'[WARDRIVER] Failed uploading session {session_id} to {service_name}: {e}')
+            logging.error(f'[WARDRIVER] Failed uploading session {session_id} to WDGWars: {e}')
+            return False
+
+    def __upload_session_to_soulcage(self, session_id):
+        api_key = self.__soulcage_api_key
+        networks = self.__db.session_networks(session_id)
+        sc_networks = []
+        for n in networks:
+            entry = {
+                'bssid':      n['mac'],
+                'ssid':       n['ssid'],
+                'auth':       self.__map_auth_mode(n['auth_mode']),
+                'first_seen': n['seen_timestamp'],
+                'lat':        float(n['latitude']),
+                'lon':        float(n['longitude']),
+                'channel':    int(n['channel']),
+                'rssi':       int(n['rssi']),
+                'type':       'WIFI',
+            }
+            try:
+                entry['alt'] = float(n['altitude'])
+            except (TypeError, ValueError):
+                pass
+            sc_networks.append(entry)
+
+        payload = {'networks': sc_networks, 'aircraft': [], 'meshcore_nodes': []}
+        body = _sign_payload(api_key, payload)
+
+        try:
+            response = requests.post(
+                url='https://soulcage.win/api/wardrive/upload/',
+                data=body,
+                headers={
+                    'Content-Type': 'application/json',
+                    'X-API-Key': api_key,
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            result = response.json()
+            logging.info(f'[WARDRIVER] Uploaded session {session_id} to SoulCage: {result.get("imported", 0)} networks queued')
+            self.__db.session_uploaded_to_soulcage(session_id)
+            return True
+        except Exception as e:
+            logging.error(f'[WARDRIVER] Failed uploading session {session_id} to SoulCage: {e}')
             return False
 
     def on_internet_available(self, agent):
@@ -917,14 +961,14 @@ class Wardriver(plugins.Plugin):
                     if len(sessions_to_upload) > 0:
                         logging.info(f'[WARDRIVER] Uploading previous sessions on WDGWars ({len(sessions_to_upload)} sessions) - current session will not be uploaded')
                         for session_id in sessions_to_upload:
-                            self.__upload_session_to_niomi(session_id, self.__wdgwars_api_key, 'https://wdgwars.pl', 'WDGWars', self.__db.session_uploaded_to_wdgwars)
+                            self.__upload_session_to_wdgwars(session_id)
 
                 if self.__soulcage_enabled:
                     sessions_to_upload = self.__db.soulcage_sessions_not_uploaded(self.__session_id)
                     if len(sessions_to_upload) > 0:
                         logging.info(f'[WARDRIVER] Uploading previous sessions on SoulCage ({len(sessions_to_upload)} sessions) - current session will not be uploaded')
                         for session_id in sessions_to_upload:
-                            self.__upload_session_to_niomi(session_id, self.__soulcage_api_key, 'https://soulcage.win', 'SoulCage', self.__db.session_uploaded_to_soulcage)
+                            self.__upload_session_to_soulcage(session_id)
     
     def on_webhook(self, path, request):
         if request.method == 'GET':
@@ -974,11 +1018,11 @@ class Wardriver(plugins.Plugin):
                 return '{ "status": "Success" }' if result else '{ "status": "Error! Check the logs" }'
             elif path.startswith('upload-wdgwars/'):
                 session_id = path.split('/')[-1]
-                result = self.__upload_session_to_niomi(session_id, self.__wdgwars_api_key, 'https://wdgwars.pl', 'WDGWars', self.__db.session_uploaded_to_wdgwars)
+                result = self.__upload_session_to_wdgwars(session_id)
                 return '{ "status": "Success" }' if result else '{ "status": "Error! Check the logs" }'
             elif path.startswith('upload-soulcage/'):
                 session_id = path.split('/')[-1]
-                result = self.__upload_session_to_niomi(session_id, self.__soulcage_api_key, 'https://soulcage.win', 'SoulCage', self.__db.session_uploaded_to_soulcage)
+                result = self.__upload_session_to_soulcage(session_id)
                 return '{ "status": "Success" }' if result else '{ "status": "Error! Check the logs" }'
             elif path == 'networks':
                 networks = self.__db.networks()
