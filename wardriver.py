@@ -7,6 +7,10 @@ import toml
 from threading import Lock
 import json
 import requests
+import base64
+import hashlib
+import hmac
+import secrets
 from PIL import Image, ImageOps
 import pwnagotchi.plugins as plugins
 from pwnagotchi.ui.components import LabeledValue, Widget
@@ -23,6 +27,13 @@ try:
 except:
     pass
 
+def _sign_payload(api_key: str, data: dict) -> bytes:
+    raw   = json.dumps(data, separators=(',', ':')).encode()
+    nonce = secrets.token_hex(8)
+    b64   = base64.b64encode(raw).decode()
+    sig   = hmac.new(api_key.encode(), (nonce + b64).encode(), hashlib.sha256).hexdigest()
+    return json.dumps({'data': b64, 'nonce': nonce, 'sig': sig}).encode()
+
 class Database():
     def __init__(self, path):
         self.__path = path
@@ -33,7 +44,12 @@ class Database():
         logging.info('[WARDRIVER] Setting up database connection...')
         self.__connection = sqlite3.connect(self.__path, check_same_thread = False, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
         cursor = self.__connection.cursor()
-        cursor.execute('CREATE TABLE IF NOT EXISTS sessions ("id" INTEGER, "created_at" TEXT DEFAULT CURRENT_TIMESTAMP, "wigle_uploaded" INTEGER DEFAULT 0, PRIMARY KEY("id" AUTOINCREMENT))') # sessions table contains wardriving sessions
+        cursor.execute('CREATE TABLE IF NOT EXISTS sessions ("id" INTEGER, "created_at" TEXT DEFAULT CURRENT_TIMESTAMP, "wigle_uploaded" INTEGER DEFAULT 0, "wdgwars_uploaded" INTEGER DEFAULT 0, "soulcage_uploaded" INTEGER DEFAULT 0, PRIMARY KEY("id" AUTOINCREMENT))') # sessions table contains wardriving sessions
+        for _col in ['wdgwars_uploaded', 'soulcage_uploaded']:
+            try:
+                cursor.execute(f'ALTER TABLE sessions ADD COLUMN "{_col}" INTEGER DEFAULT 0')
+            except Exception:
+                pass
         cursor.execute('CREATE TABLE IF NOT EXISTS networks ("id" INTEGER, "mac" TEXT NOT NULL, "ssid" TEXT, PRIMARY KEY ("id" AUTOINCREMENT))') # networks table contains seen networks without coordinates/sessions info
         cursor.execute('CREATE TABLE IF NOT EXISTS wardrive ("id" INTEGER, "session_id" INTEGER NOT NULL, "network_id" INTEGER NOT NULL, "auth_mode" TEXT NOT NULL, "latitude" TEXT NOT NULL, "longitude" TEXT NOT NULL, "altitude" TEXT NOT NULL, "accuracy" INTEGER NOT NULL, "channel" INTEGER NOT NULL, "rssi" INTEGER NOT NULL, "seen_timestamp" TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY("id" AUTOINCREMENT), FOREIGN KEY("session_id") REFERENCES sessions("id"), FOREIGN KEY("network_id") REFERENCES networks("id"))') # wardrive table contains the relations between sessions and networks with timestamp and coordinates
         cursor.close()
@@ -112,7 +128,19 @@ class Database():
         cursor.execute('UPDATE sessions SET "wigle_uploaded" = 1 WHERE id = ?', [session_id])
         cursor.close()
         self.__connection.commit()
-    
+
+    def session_uploaded_to_wdgwars(self, session_id):
+        cursor = self.__connection.cursor()
+        cursor.execute('UPDATE sessions SET "wdgwars_uploaded" = 1 WHERE id = ?', [session_id])
+        cursor.close()
+        self.__connection.commit()
+
+    def session_uploaded_to_soulcage(self, session_id):
+        cursor = self.__connection.cursor()
+        cursor.execute('UPDATE sessions SET "soulcage_uploaded" = 1 WHERE id = ?', [session_id])
+        cursor.close()
+        self.__connection.commit()
+
     def wigle_sessions_not_uploaded(self, current_session_id):
         '''
         Return the list of ids of sessions that haven't got uploaded on WiGLE excluding `current_session_id`
@@ -120,6 +148,26 @@ class Database():
         cursor = self.__connection.cursor()
         sessions_ids = []
         cursor.execute('SELECT id FROM sessions WHERE wigle_uploaded = 0 AND id <> ?', [current_session_id])
+        rows = cursor.fetchall()
+        for row in rows:
+            sessions_ids.append(row[0])
+        cursor.close()
+        return sessions_ids
+
+    def wdgwars_sessions_not_uploaded(self, current_session_id):
+        cursor = self.__connection.cursor()
+        sessions_ids = []
+        cursor.execute('SELECT id FROM sessions WHERE wdgwars_uploaded = 0 AND id <> ?', [current_session_id])
+        rows = cursor.fetchall()
+        for row in rows:
+            sessions_ids.append(row[0])
+        cursor.close()
+        return sessions_ids
+
+    def soulcage_sessions_not_uploaded(self, current_session_id):
+        cursor = self.__connection.cursor()
+        sessions_ids = []
+        cursor.execute('SELECT id FROM sessions WHERE soulcage_uploaded = 0 AND id <> ?', [current_session_id])
         rows = cursor.fetchall()
         for row in rows:
             sessions_ids.append(row[0])
@@ -143,12 +191,18 @@ class Database():
         cursor.execute('SELECT COUNT(id) FROM sessions')
         total_sessions = cursor.fetchone()[0]
         cursor.execute('SELECT COUNT(id) FROM sessions WHERE wigle_uploaded = 1')
-        sessions_uploaded = cursor.fetchone()[0]
+        sessions_wigle_uploaded = cursor.fetchone()[0]
+        cursor.execute('SELECT COUNT(id) FROM sessions WHERE wdgwars_uploaded = 1')
+        sessions_wdgwars_uploaded = cursor.fetchone()[0]
+        cursor.execute('SELECT COUNT(id) FROM sessions WHERE soulcage_uploaded = 1')
+        sessions_soulcage_uploaded = cursor.fetchone()[0]
         cursor.close()
         return {
             'total_networks': total_networks,
             'total_sessions': total_sessions,
-            'sessions_uploaded': sessions_uploaded
+            'sessions_uploaded': sessions_wigle_uploaded,
+            'sessions_wdgwars_uploaded': sessions_wdgwars_uploaded,
+            'sessions_soulcage_uploaded': sessions_soulcage_uploaded,
         }
     
     def sessions(self):
@@ -161,7 +215,9 @@ class Database():
                 'id': row[0],
                 'created_at': row[1],
                 'wigle_uploaded': row[2] == 1,
-                'networks': row[3]
+                'wdgwars_uploaded': row[3] == 1,
+                'soulcage_uploaded': row[4] == 1,
+                'networks': row[5]
             })
         cursor.close()
         return sessions
@@ -417,7 +473,7 @@ class PwndroidClient:
 
 class Wardriver(plugins.Plugin):
     __author__ = 'CyberArtemio'
-    __version__ = '2.3'
+    __version__ = '2.4'
     __license__ = 'GPL3'
     __description__ = 'A wardriving plugin for pwnagotchi. Saves all networks seen and uploads data to WiGLE once internet is available'
 
@@ -501,13 +557,37 @@ class Wardriver(plugins.Plugin):
             self.__wigle_donate = False
         try:
             self.__wigle_enabled = self.options['wigle']['enabled']
-            
+
             if self.__wigle_enabled and (not self.__wigle_api_key or self.__wigle_api_key == ''):
                 logging.error('[WARDRIVER] Wigle enabled but no api key provided!')
                 self.__wigle_enabled = False
         except Exception:
             self.__wigle_enabled = False
-        
+
+        try:
+            self.__wdgwars_api_key = self.options['wdgwars']['api_key']
+        except Exception:
+            self.__wdgwars_api_key = None
+        try:
+            self.__wdgwars_enabled = self.options['wdgwars']['enabled']
+            if self.__wdgwars_enabled and not self.__wdgwars_api_key:
+                logging.error('[WARDRIVER] WDGWars enabled but no api_key provided!')
+                self.__wdgwars_enabled = False
+        except Exception:
+            self.__wdgwars_enabled = False
+
+        try:
+            self.__soulcage_api_key = self.options['soulcage']['api_key']
+        except Exception:
+            self.__soulcage_api_key = None
+        try:
+            self.__soulcage_enabled = self.options['soulcage']['enabled']
+            if self.__soulcage_enabled and not self.__soulcage_api_key:
+                logging.error('[WARDRIVER] SoulCage enabled but no api_key provided!')
+                self.__soulcage_enabled = False
+        except Exception:
+            self.__soulcage_enabled = False
+
         self.__gps_config = dict()
         try:
             self.__gps_config['method'] = self.options['gps']['method']
@@ -536,6 +616,10 @@ class Wardriver(plugins.Plugin):
         if self.__wigle_enabled:
             logging.info('[WARDRIVER] Previous sessions will be uploaded to WiGLE once internet is available')
             logging.info('[WARDRIVER] Join the WiGLE group: search "The crew of the Black Pearl" and start wardriving with us!')
+        if self.__wdgwars_enabled:
+            logging.info('[WARDRIVER] Previous sessions will be uploaded to WDGWars once internet is available')
+        if self.__soulcage_enabled:
+            logging.info('[WARDRIVER] Previous sessions will be uploaded to SoulCage once internet is available')
 
         self.__session_id = self.__db.new_wardriving_session()
 
@@ -749,6 +833,121 @@ class Wardriver(plugins.Plugin):
         else:
             return False
     
+    @staticmethod
+    def __map_auth_mode(auth_mode):
+        if 'WPA3' in auth_mode:
+            return 'WPA3'
+        elif 'WPA2' in auth_mode:
+            return 'WPA2'
+        elif 'WPA' in auth_mode:
+            return 'WPA'
+        elif 'WEP' in auth_mode:
+            return 'WEP'
+        return 'OPEN'
+
+    def __upload_session_to_wdgwars(self, session_id):
+        api_key = self.__wdgwars_api_key
+        networks = self.__db.session_networks(session_id)
+        wdg_networks = []
+        for n in networks:
+            entry = {
+                'bssid':      n['mac'],
+                'ssid':       n['ssid'],
+                'auth':       self.__map_auth_mode(n['auth_mode']),
+                'first_seen': n['seen_timestamp'],
+                'lat':        float(n['latitude']),
+                'lon':        float(n['longitude']),
+                'channel':    int(n['channel']),
+                'rssi':       int(n['rssi']),
+                'type':       'WIFI',
+            }
+            try:
+                entry['alt'] = float(n['altitude'])
+            except (TypeError, ValueError):
+                pass
+            wdg_networks.append(entry)
+
+        chunk_size = 50000
+        chunks = [wdg_networks[i:i + chunk_size] for i in range(0, max(len(wdg_networks), 1), chunk_size)]
+        try:
+            for idx, chunk in enumerate(chunks):
+                if len(chunks) > 1:
+                    logging.info(f'[WARDRIVER] Uploading session {session_id} to WDGWars: chunk {idx + 1}/{len(chunks)}')
+                payload = {'networks': chunk, 'aircraft': [], 'meshcore_nodes': []}
+                body = _sign_payload(api_key, payload)
+                response = requests.post(
+                    url='https://wdgwars.pl/api/upload/',
+                    data=body,
+                    headers={
+                        'Content-Type': 'application/json',
+                        'X-API-Key': api_key,
+                        'User-Agent': f'wardriver-pwnagotchi/{Wardriver.__version__}',
+                    },
+                    timeout=60,
+                )
+                response.raise_for_status()
+                result = response.json()
+                logging.info(f'[WARDRIVER] Uploaded session {session_id} to WDGWars (chunk {idx + 1}/{len(chunks)}): {result.get("imported", 0)} networks imported')
+            self.__db.session_uploaded_to_wdgwars(session_id)
+            return True
+        except requests.HTTPError as e:
+            logging.error(f'[WARDRIVER] Failed uploading session {session_id} to WDGWars: {e} — {e.response.text[:200]}')
+            return False
+        except Exception as e:
+            logging.error(f'[WARDRIVER] Failed uploading session {session_id} to WDGWars: {e}')
+            return False
+
+    def __upload_session_to_soulcage(self, session_id):
+        api_key = self.__soulcage_api_key
+        networks = self.__db.session_networks(session_id)
+        sc_networks = []
+        for n in networks:
+            entry = {
+                'bssid':      n['mac'],
+                'ssid':       n['ssid'],
+                'auth':       self.__map_auth_mode(n['auth_mode']),
+                'first_seen': n['seen_timestamp'],
+                'lat':        float(n['latitude']),
+                'lon':        float(n['longitude']),
+                'channel':    int(n['channel']),
+                'rssi':       int(n['rssi']),
+                'type':       'WIFI',
+            }
+            try:
+                entry['alt'] = float(n['altitude'])
+            except (TypeError, ValueError):
+                pass
+            sc_networks.append(entry)
+
+        chunk_size = 50000
+        chunks = [sc_networks[i:i + chunk_size] for i in range(0, max(len(sc_networks), 1), chunk_size)]
+        try:
+            for idx, chunk in enumerate(chunks):
+                if len(chunks) > 1:
+                    logging.info(f'[WARDRIVER] Uploading session {session_id} to SoulCage: chunk {idx + 1}/{len(chunks)}')
+                payload = {'networks': chunk, 'aircraft': [], 'meshcore_nodes': []}
+                body = _sign_payload(api_key, payload)
+                response = requests.post(
+                    url='https://soulcage.win/api/wardrive/upload/',
+                    data=body,
+                    headers={
+                        'Content-Type': 'application/json',
+                        'X-API-Key': api_key,
+                    },
+                    timeout=60,
+                )
+                response.raise_for_status()
+                result = response.json()
+                logging.info(f'[WARDRIVER] Uploaded session {session_id} to SoulCage (chunk {idx + 1}/{len(chunks)}): {result.get("imported", 0)} networks imported')
+            self.__db.session_uploaded_to_soulcage(session_id)
+            return True
+        except requests.HTTPError as e:
+            logging.error(f'[WARDRIVER] Failed uploading session {session_id} to SoulCage: {e} — {e.response.text[:200]}')
+            return False
+        except Exception as e:
+            logging.error(f'[WARDRIVER] Failed uploading session {session_id} to SoulCage: {e}')
+            return False
+
     def on_internet_available(self, agent):
         if not self.__lock.locked() and self.ready:
             with self.__lock:
@@ -769,9 +968,22 @@ class Wardriver(plugins.Plugin):
                     sessions_to_upload = self.__db.wigle_sessions_not_uploaded(self.__session_id)
                     if len(sessions_to_upload) > 0:
                         logging.info(f'[WARDRIVER] Uploading previous sessions on WiGLE ({len(sessions_to_upload)} sessions) - current session will not be uploaded')
-
                         for session_id in sessions_to_upload:
                             self.__upload_session_to_wigle(session_id)
+
+                if self.__wdgwars_enabled:
+                    sessions_to_upload = self.__db.wdgwars_sessions_not_uploaded(self.__session_id)
+                    if len(sessions_to_upload) > 0:
+                        logging.info(f'[WARDRIVER] Uploading previous sessions on WDGWars ({len(sessions_to_upload)} sessions) - current session will not be uploaded')
+                        for session_id in sessions_to_upload:
+                            self.__upload_session_to_wdgwars(session_id)
+
+                if self.__soulcage_enabled:
+                    sessions_to_upload = self.__db.soulcage_sessions_not_uploaded(self.__session_id)
+                    if len(sessions_to_upload) > 0:
+                        logging.info(f'[WARDRIVER] Uploading previous sessions on SoulCage ({len(sessions_to_upload)} sessions) - current session will not be uploaded')
+                        for session_id in sessions_to_upload:
+                            self.__upload_session_to_soulcage(session_id)
     
     def on_webhook(self, path, request):
         if request.method == 'GET':
@@ -797,6 +1009,8 @@ class Wardriver(plugins.Plugin):
                 stats = self.__db.general_stats()
                 stats['config'] = {
                     'wigle_enabled': self.__wigle_enabled,
+                    'wdgwars_enabled': self.__wdgwars_enabled,
+                    'soulcage_enabled': self.__soulcage_enabled,
                     'whitelist': self.__whitelist,
                     'db_path': self.__path,
                     'ui_enabled': self.__ui_enabled,
@@ -812,11 +1026,33 @@ class Wardriver(plugins.Plugin):
             elif path == 'sessions':
                 sessions = self.__db.sessions()
                 return json.dumps(sessions)
-            elif 'upload/' in path:
+            elif path.startswith('upload/'):
                 session_id = path.split('/')[-1]
                 result = self.__upload_session_to_wigle(session_id)
                 logging.info(result)
-                return '{ "status": "Success" }' if result else'{ "status": "Error! Check the logs" }'
+                return '{ "status": "Success" }' if result else '{ "status": "Error! Check the logs" }'
+            elif path.startswith('upload-wdgwars/'):
+                session_id = path.split('/')[-1]
+                result = self.__upload_session_to_wdgwars(session_id)
+                return '{ "status": "Success" }' if result else '{ "status": "Error! Check the logs" }'
+            elif path.startswith('upload-soulcage/'):
+                session_id = path.split('/')[-1]
+                result = self.__upload_session_to_soulcage(session_id)
+                return '{ "status": "Success" }' if result else '{ "status": "Error! Check the logs" }'
+            elif path == 'wdgwars-me':
+                if not self.__wdgwars_enabled:
+                    abort(403)
+                r = requests.get('https://wdgwars.pl/api/me', headers={'X-API-Key': self.__wdgwars_api_key, 'User-Agent': f'wardriver-pwnagotchi/{self.__version__}'}, timeout=10)
+                if 'application/json' not in r.headers.get('Content-Type', ''):
+                    abort(502)
+                return r.text
+            elif path == 'soulcage-me':
+                if not self.__soulcage_enabled:
+                    abort(403)
+                r = requests.get('https://soulcage.win/api/wardrive/me', headers={'X-API-Key': self.__soulcage_api_key}, timeout=10)
+                if 'application/json' not in r.headers.get('Content-Type', ''):
+                    abort(502)
+                return r.text
             elif path == 'networks':
                 networks = self.__db.networks()
                 return json.dumps(networks)
@@ -1033,8 +1269,20 @@ HTML_PAGE = '''
                         </div>
                         <div>
                             <article class="center">
-                                <header>Sessions uploaded</header>
+                                <header>WiGLE uploads</header>
                                 <span id="sessions-uploaded"></span>
+                            </article>
+                        </div>
+                        <div>
+                            <article class="center">
+                                <header>WDGWars uploads</header>
+                                <span id="sessions-wdgwars-uploaded"></span>
+                            </article>
+                        </div>
+                        <div>
+                            <article class="center">
+                                <header>SoulCage uploads</header>
+                                <span id="sessions-soulcage-uploaded"></span>
                             </article>
                         </div>
                     </div>
@@ -1054,11 +1302,38 @@ HTML_PAGE = '''
                                 <div id="wigle-badge" class="center"></div>
                             </article>
                         </div>
+                        <div id="wdgwars-profile" style="display:none">
+                            <h3>Your WDGWars profile</h3>
+                            <article>
+                                <ul>
+                                    <li><b>Username</b>: <span id="wdgwars-username">-</span></li>
+                                    <li><b>Gang</b>: <span id="wdgwars-gang">-</span></li>
+                                    <li><b>Total</b>: <span id="wdgwars-total">-</span> (<span id="wdgwars-wifi">-</span> WiFi / <span id="wdgwars-ble">-</span> BLE / <span id="wdgwars-aircraft">-</span> Aircraft / <span id="wdgwars-mesh">-</span> Mesh)</li>
+                                    <li><b>Last 7 days</b>: <span id="wdgwars-recent7d">-</span></li>
+                                    <li><b>Credits</b>: <span id="wdgwars-credits">-</span></li>
+                                </ul>
+                            </article>
+                        </div>
+                        <div id="soulcage-profile" style="display:none">
+                            <h3>Your SoulCage profile</h3>
+                            <article>
+                                <ul>
+                                    <li><b>Username</b>: <span id="soulcage-username">-</span></li>
+                                    <li><b>Gang</b>: <span id="soulcage-gang">-</span></li>
+                                    <li><b>Total</b>: <span id="soulcage-total">-</span> (<span id="soulcage-wifi">-</span> WiFi / <span id="soulcage-ble">-</span> BLE / <span id="soulcage-aircraft">-</span> Aircraft / <span id="soulcage-mesh">-</span> Mesh)</li>
+                                    <li><b>Cracked</b>: <span id="soulcage-cracked">-</span></li>
+                                </ul>
+                            </article>
+                        </div>
+                    </div>
+                    <div class="grid">
                         <div>
                             <h3>Current plugin config</h3>
                             <article>
                                 <ul>
                                     <li><b>WiGLE automatic upload</b>: <span id="config-wigle">-</span></li>
+                                    <li><b>WDGWars automatic upload</b>: <span id="config-wdgwars">-</span></li>
+                                    <li><b>SoulCage automatic upload</b>: <span id="config-soulcage">-</span></li>
                                     <li><b>UI enabled</b>: <span id="config-ui">-</span></li>
                                     <li><b>Database file path</b>: <span id="config-db">-</span></li>
                                     <li><b>GPS</b>:<ul id="config-gps"></ul></li>
@@ -1072,7 +1347,9 @@ HTML_PAGE = '''
                     <h3>Wardriving sessions</h3>
                     <p><b>Actions:</b><br />
                     <i class="fa-solid fa-file-csv"></i> : download session's CSV file<br />
-                    <i class="fa-solid fa-cloud-arrow-up"></i> : upload session to WiGLE<br />
+                    <i class="fa-solid fa-cloud-arrow-up" style="color:#4a90d9"></i> : upload session to WiGLE<br />
+                    <i class="fa-solid fa-globe" style="color:#e07b39"></i> : upload session to WDGWars<br />
+                    <i class="fa-solid fa-skull-crossbones" style="color:#8b3dbb"></i> : upload session to SoulCage<br />
                     <!--<i class="fa-solid fa-trash"></i> : delete the session (<b>not the networks</b>)-->
                     </p>
                     <div class="overflow-auto">
@@ -1081,7 +1358,9 @@ HTML_PAGE = '''
                                 <th scope="col">ID</th>
                                 <th scope="col">Date</th>
                                 <th scope="col">Networks</th>
-                                <th scope="col">Uploaded</th>
+                                <th scope="col">WiGLE</th>
+                                <th scope="col">WDGWars</th>
+                                <th scope="col">SoulCage</th>
                                 <th scope="col">Actions</th>
                             </thead>
                             <tbody id="sessions-table">
@@ -1161,6 +1440,20 @@ HTML_PAGE = '''
 
         function uploadSessionsToWigle(session_id) {
             request('GET', '/plugins/wardriver/upload/' + session_id, function(message) {
+                showSessions()
+                alert(message.status)
+            })
+        }
+
+        function uploadSessionToWdgwars(session_id) {
+            request('GET', '/plugins/wardriver/upload-wdgwars/' + session_id, function(message) {
+                showSessions()
+                alert(message.status)
+            })
+        }
+
+        function uploadSessionToSoulcage(session_id) {
+            request('GET', '/plugins/wardriver/upload-soulcage/' + session_id, function(message) {
                 showSessions()
                 alert(message.status)
             })
@@ -1280,7 +1573,11 @@ HTML_PAGE = '''
                 document.getElementById("total-networks").innerText = data.total_networks
                 document.getElementById("total-sessions").innerText = data.total_sessions
                 document.getElementById("sessions-uploaded").innerText = data.sessions_uploaded
+                document.getElementById("sessions-wdgwars-uploaded").innerText = data.sessions_wdgwars_uploaded
+                document.getElementById("sessions-soulcage-uploaded").innerText = data.sessions_soulcage_uploaded
                 document.getElementById("config-wigle").innerText = data.config.wigle_enabled ? "enabled" : "disabled"
+                document.getElementById("config-wdgwars").innerText = data.config.wdgwars_enabled ? "enabled" : "disabled"
+                document.getElementById("config-soulcage").innerText = data.config.soulcage_enabled ? "enabled" : "disabled"
                 document.getElementById("config-ui").innerText = data.config.ui_enabled
                 document.getElementById("config-db").innerText = data.config.db_path
                 document.getElementById("config-whitelist").innerHTML = ""
@@ -1318,6 +1615,33 @@ HTML_PAGE = '''
                         document.getElementById("wigle-badge").innerHTML = "<img src='https://wigle.net" + stats.imageBadgeUrl +"' alt='wigle-profile-badge' />"
                     })
                 }
+                if(data.config.wdgwars_enabled) {
+                    document.getElementById("wdgwars-profile").style.display = ""
+                    request('GET', '/plugins/wardriver/wdgwars-me', function(p) {
+                        document.getElementById("wdgwars-username").innerText = p.username
+                        document.getElementById("wdgwars-gang").innerText = p.gang || "-"
+                        document.getElementById("wdgwars-total").innerText = p.total
+                        document.getElementById("wdgwars-wifi").innerText = p.wifi
+                        document.getElementById("wdgwars-ble").innerText = p.ble
+                        document.getElementById("wdgwars-aircraft").innerText = p.aircraft
+                        document.getElementById("wdgwars-mesh").innerText = p.mesh
+                        document.getElementById("wdgwars-recent7d").innerText = p.recent_7d
+                        document.getElementById("wdgwars-credits").innerText = p.credits ? p.credits.balance : "-"
+                    })
+                }
+                if(data.config.soulcage_enabled) {
+                    document.getElementById("soulcage-profile").style.display = ""
+                    request('GET', '/plugins/wardriver/soulcage-me', function(p) {
+                        document.getElementById("soulcage-username").innerText = p.username
+                        document.getElementById("soulcage-gang").innerText = p.gang || "-"
+                        document.getElementById("soulcage-total").innerText = p.total
+                        document.getElementById("soulcage-wifi").innerText = p.wifi
+                        document.getElementById("soulcage-ble").innerText = p.ble
+                        document.getElementById("soulcage-aircraft").innerText = p.aircraft
+                        document.getElementById("soulcage-mesh").innerText = p.mesh
+                        document.getElementById("soulcage-cracked").innerText = p.cracked
+                    })
+                }
             })
         }
         function showSessions() {
@@ -1331,29 +1655,50 @@ HTML_PAGE = '''
                     var createdCol = document.createElement("td")
                     var networksCol = document.createElement("td")
                     var wigleCol = document.createElement("td")
+                    var wdgwarsCol = document.createElement("td")
+                    var soulcageCol = document.createElement("td")
                     var actionsCol = document.createElement("td")
 
                     idCol.innerHTML = session.id
                     createdCol.innerHTML = session.created_at
                     networksCol.innerHTML = session.networks
                     wigleCol.innerHTML = "<i class='fa-regular " + (session.wigle_uploaded ? "fa-square-check" : "fa-square") + "'></i>"
-                    csvIcon = document.createElement('i')
+                    wdgwarsCol.innerHTML = "<i class='fa-regular " + (session.wdgwars_uploaded ? "fa-square-check" : "fa-square") + "'></i>"
+                    soulcageCol.innerHTML = "<i class='fa-regular " + (session.soulcage_uploaded ? "fa-square-check" : "fa-square") + "'></i>"
+
+                    var csvIcon = document.createElement('i')
                     csvIcon.className = 'fa-solid fa-file-csv'
                     csvIcon.addEventListener("click", function(session_id) { return function() { downloadCSV(session_id)} } (session.id))
-                    wigleIcon = document.createElement('i')
-                    wigleIcon.className = 'fa-solid fa-cloud-arrow-up'
-                    deleteIcon = document.createElement('i')
-                    deleteIcon.className = 'fa-solid fa-trash'
                     actionsCol.appendChild(csvIcon)
+
                     if(!session.wigle_uploaded) {
+                        var wigleIcon = document.createElement('i')
+                        wigleIcon.className = 'fa-solid fa-cloud-arrow-up'
+                        wigleIcon.style.color = '#4a90d9'
                         wigleIcon.addEventListener("click", function(session_id) { return function() { uploadSessionsToWigle(session_id)} } (session.id))
                         actionsCol.appendChild(wigleIcon)
+                    }
+                    if(!session.wdgwars_uploaded) {
+                        var wdgwarsIcon = document.createElement('i')
+                        wdgwarsIcon.className = 'fa-solid fa-globe'
+                        wdgwarsIcon.style.color = '#e07b39'
+                        wdgwarsIcon.addEventListener("click", function(session_id) { return function() { uploadSessionToWdgwars(session_id)} } (session.id))
+                        actionsCol.appendChild(wdgwarsIcon)
+                    }
+                    if(!session.soulcage_uploaded) {
+                        var soulcageIcon = document.createElement('i')
+                        soulcageIcon.className = 'fa-solid fa-skull-crossbones'
+                        soulcageIcon.style.color = '#8b3dbb'
+                        soulcageIcon.addEventListener("click", function(session_id) { return function() { uploadSessionToSoulcage(session_id)} } (session.id))
+                        actionsCol.appendChild(soulcageIcon)
                     }
                     //actionsCol.appendChild(deleteIcon)
                     tableRow.appendChild(idCol)
                     tableRow.appendChild(createdCol)
                     tableRow.appendChild(networksCol)
                     tableRow.appendChild(wigleCol)
+                    tableRow.appendChild(wdgwarsCol)
+                    tableRow.appendChild(soulcageCol)
                     tableRow.appendChild(actionsCol)
                     sessionsTable.appendChild(tableRow)
                 }
